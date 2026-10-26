@@ -16,6 +16,7 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/xtls/xray-core/app/observatory"
 	"github.com/xtls/xray-core/app/observatory/burst"
+	commonlog "github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
 	"github.com/xtls/xray-core/infra/conf"
@@ -29,7 +30,7 @@ import (
 const defaultCheckConfDir = "/usr/local/etc/xray"
 
 var cmdCheck = &base.Command{
-	UsageLine:   "{{.Exec}} check [-c config.json] [-confdir dir] [-format fmt] [-list file] [--set path=value]... <tag> [<ip>] <count> <interval>",
+	UsageLine:   "{{.Exec}} check [-c config.json] [-confdir dir] [-format fmt] [-v] [-list file] [--set path=value]... <tag> [<ip>] <count> <interval>",
 	Short:       "Check health of an outbound",
 	CustomFlags: true,
 	Long: `
@@ -67,8 +68,9 @@ xray is not affected. TLS serverName and xhttp host stay as
 configured. Only the checks below are run: no observatory rounds and
 no saved results are used.
 
-Progress goes to stderr: loaded config files, started outbounds and
-the ping timeout, then "check i/n: ok|failed in <time>" per check.
+Only the result line is printed. With -v, progress goes to stderr:
+loaded config files, started outbounds and the ping timeout, then
+"check i/n: ok|failed in <time>" per check. xray's own logs are off.
 
 The --set path=value flag overrides one more field of the checked
 outbound. The path is dot-separated from the outbound root,
@@ -111,6 +113,7 @@ func runCheck(args []string) error {
 	fs.StringVar(format, "format", "auto", "Format of input file.")
 	fs.Var(&sets, "set", "Override outbound field: path=value")
 	fs.StringVar(&listFile, "list", "", "File with IPs to check, one per line")
+	fs.BoolVar(&checkVerbose, "v", false, "Print progress to stderr")
 
 	var positional []string
 	for {
@@ -155,7 +158,9 @@ func runCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "config:", strings.Join(files, ", "))
+	progressf("config: %s\n", strings.Join(files, ", "))
+	// xray's own logs (config merge, pings) are not shown
+	commonlog.RegisterHandler(discardLog{})
 	// do not read or overwrite the saved results of a running xray, and
 	// run only the checks below, without observatory's own rounds
 	burst.DisablePersistence = true
@@ -202,6 +207,18 @@ func checkConfigFiles() ([]string, error) {
 	return configFiles, nil
 }
 
+var checkVerbose bool
+
+func progressf(format string, a ...any) {
+	if checkVerbose {
+		fmt.Fprintf(os.Stderr, format, a...)
+	}
+}
+
+type discardLog struct{}
+
+func (discardLog) Handle(commonlog.Message) {}
+
 func readIPList(file string) ([]string, error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
@@ -227,7 +244,7 @@ func checkOne(files []string, tag, ip string, sets []string, count int, interval
 	if err != nil {
 		return "", err
 	}
-	fmt.Fprintf(os.Stderr, "%s: starting xray, %s\n", ip, info)
+	progressf("%s: starting xray, %s\n", ip, info)
 
 	server, err := core.New(cfg)
 	if err != nil {
@@ -262,7 +279,7 @@ func checkOne(files []string, tag, ip string, sets []string, count int, interval
 		case prev == nil && hp.Fail > 0, prev != nil && hp.Fail > prev.Fail:
 			state = "failed"
 		}
-		fmt.Fprintf(os.Stderr, "%s: check %d/%d: %s in %v\n", ip, i+1, count, state, time.Since(start).Round(time.Millisecond))
+		progressf("%s: check %d/%d: %s in %v\n", ip, i+1, count, state, time.Since(start).Round(time.Millisecond))
 	}
 
 	alive, delay := false, int64(0)
@@ -300,7 +317,7 @@ func closeWithTimeout(server *core.Instance, d time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(d):
-		fmt.Fprintf(os.Stderr, "xray instance did not close in %v, continuing\n", d)
+		progressf("xray instance did not close in %v, continuing\n", d)
 	}
 }
 
@@ -495,6 +512,7 @@ func loadCheckConfig(files []string, tag, ip string, sets []string, count int) (
 	merged.FakeDNS = nil
 	merged.Geodata = nil
 	merged.Reverse = nil
+	merged.LogConfig = &conf.LogConfig{AccessLog: "none", ErrorLog: "none", LogLevel: "none"}
 
 	cfg, err = merged.Build()
 	if err != nil {
