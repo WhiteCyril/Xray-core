@@ -71,3 +71,91 @@ func TestSetAddressKeepsServerName(t *testing.T) {
 		t.Errorf("serverName changed: %v", sni)
 	}
 }
+
+func resetCheckConfigFlags() {
+	configFiles = nil
+	configDir = ""
+}
+
+func TestCheckConfigFiles(t *testing.T) {
+	defer resetCheckConfigFlags()
+
+	// split config: all files in name order
+	dir := t.TempDir()
+	for _, n := range []string{"03_routing.json", "00_log.json", "06_outbounds.json", "notes.txt"} {
+		os.WriteFile(filepath.Join(dir, n), []byte("{}"), 0o600)
+	}
+	resetCheckConfigFlags()
+	configDir = dir
+	got, err := checkConfigFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join(dir, "00_log.json"),
+		filepath.Join(dir, "03_routing.json"),
+		filepath.Join(dir, "06_outbounds.json"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("split: %v, want %v", got, want)
+	}
+
+	// single file in dir
+	one := t.TempDir()
+	os.WriteFile(filepath.Join(one, "config.json"), []byte("{}"), 0o600)
+	resetCheckConfigFlags()
+	configDir = one
+	if got, err := checkConfigFiles(); err != nil || len(got) != 1 {
+		t.Errorf("single: %v, %v", got, err)
+	}
+
+	// -c file without -confdir does not use the default dir
+	resetCheckConfigFlags()
+	configFiles.Set(filepath.Join(one, "config.json"))
+	if got, err := checkConfigFiles(); err != nil || len(got) != 1 || configDir != "" {
+		t.Errorf("-c: %v, %v, dir %q", got, err, configDir)
+	}
+
+	// empty and missing dirs are errors, never stdin
+	resetCheckConfigFlags()
+	configDir = t.TempDir()
+	if _, err := checkConfigFiles(); err == nil {
+		t.Error("expected error for empty dir")
+	}
+	resetCheckConfigFlags()
+	configDir = filepath.Join(dir, "missing")
+	if _, err := checkConfigFiles(); err == nil {
+		t.Error("expected error for missing dir")
+	}
+}
+
+func TestKeepOutbounds(t *testing.T) {
+	var doc1, doc2 map[string]any
+	decodeJSONNumber([]byte(`{"outbounds":[
+		{"tag":"direct","protocol":"freedom"},
+		{"tag":"cf_22","streamSettings":{"sockopt":{"dialerProxy":"chain1-fragment"}}},
+		{"tag":"cf_23","streamSettings":{"sockopt":{"dialerProxy":"chain2-fragment"}}}
+	]}`), &doc1)
+	decodeJSONNumber([]byte(`{"log":{},"outbounds":[
+		{"tag":"chain1-fragment","streamSettings":{"sockopt":{"dialerProxy":"direct"}}},
+		{"tag":"chain2-fragment"},
+		{"tag":"block"}
+	]}`), &doc2)
+	docs := []map[string]any{doc1, doc2}
+	kept, err := keepOutbounds(docs, "cf_22")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"direct", "cf_22", "chain1-fragment"}; !reflect.DeepEqual(kept, want) {
+		t.Errorf("kept %v, want %v", kept, want)
+	}
+	if n := len(doc2["outbounds"].([]any)); n != 1 {
+		t.Errorf("doc2 has %d outbounds, want 1", n)
+	}
+
+	var doc3 map[string]any
+	decodeJSONNumber([]byte(`{"outbounds":[{"tag":"f_1","proxySettings":{"tag":"nope"}}]}`), &doc3)
+	if _, err := keepOutbounds([]map[string]any{doc3}, "f_1"); err == nil {
+		t.Error("expected error for missing proxySettings outbound")
+	}
+}
